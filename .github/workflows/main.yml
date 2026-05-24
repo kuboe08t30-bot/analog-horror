@@ -1,0 +1,296 @@
+"""Discordへ「今日のアナログホラーアイデア」を投稿するスクリプト。
+
+ローカル実行:
+    python main.py
+
+投稿せず内容だけ確認:
+    python main.py --preview
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+import requests
+from dotenv import load_dotenv
+
+from prompts import SYSTEM_PROMPT, build_user_prompt, fallback_idea
+
+
+JST = ZoneInfo("Asia/Tokyo")
+DEFAULT_MODEL = "gpt-5-mini"
+DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
+
+
+def setup_logging() -> None:
+    """GitHub Actionsでも読みやすい形式でログを出します。"""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def load_settings() -> tuple[str | None, str | None, str]:
+    """環境変数を読み込みます。
+
+    ローカルでは .env があれば自動で読みます。
+    GitHub Actionsでは Secrets から環境変数として渡されます。
+    """
+
+    load_dotenv()
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    api_key = os.getenv("OPENAI_API_KEY")
+    model = os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
+    return webhook_url, api_key, model
+
+
+def generate_idea(api_key: str | None, model: str, today: date) -> str:
+    """OpenAI APIで企画案を生成します。
+
+    APIキーがない場合や、API呼び出しで失敗した場合はフォールバック案を返します。
+    これにより「Discord投稿の動作確認」だけならAPIキーなしでもできます。
+    """
+
+    if not api_key:
+        logging.warning("OPENAI_API_KEY が未設定です。フォールバック案を使用します。")
+        return fallback_idea(today)
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=model,
+            instructions=SYSTEM_PROMPT,
+            input=build_user_prompt(today),
+            max_output_tokens=1800,
+        )
+        idea = response.output_text.strip()
+    except Exception:
+        logging.exception("OpenAI APIでの生成に失敗しました。フォールバック案を使用します。")
+        return fallback_idea(today)
+
+    if not idea:
+        logging.warning("OpenAI APIの返答が空でした。フォールバック案を使用します。")
+        return fallback_idea(today)
+
+    return idea
+
+
+def build_discord_payload(message: str) -> dict[str, object]:
+    """Discord Webhookへ送るJSONを作ります。"""
+
+    lines = message.strip().splitlines()
+    title = lines[0].strip() if lines else "【今日のアナログホラー案】"
+    description = "\n".join(lines[1:]).strip() if len(lines) > 1 else message.strip()
+
+    if len(description) > DISCORD_EMBED_DESCRIPTION_LIMIT:
+        logging.warning(
+            "Discordの埋め込み本文の上限に近いため、%s文字に短縮します。",
+            DISCORD_EMBED_DESCRIPTION_LIMIT,
+        )
+        description = (
+            description[: DISCORD_EMBED_DESCRIPTION_LIMIT - 20].rstrip()
+            + "\n\n（文字数調整済み）"
+        )
+
+    return {
+        "embeds": [
+            {
+                "title": title[:256],
+                "description": description,
+                "color": 0x2F3136,
+            }
+        ]
+    }
+
+
+def post_to_discord(webhook_url: str | None, message: str) -> None:
+    """Discord Webhookへ投稿します。"""
+
+    if not webhook_url:
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL が未設定です。READMEの手順に沿って "
+            ".env または GitHub Secrets に登録してください。"
+        )
+
+    response = requests.post(
+        webhook_url,
+        json=build_discord_payload(message),
+        timeout=20,
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            "Discordへの投稿に失敗しました。"
+            f"status={response.status_code}, body={response.text}"
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    """コマンドライン引数を読みます。"""
+
+    parser = argparse.ArgumentParser(
+        description="今日のアナログホラーアイデアをDiscordへ投稿します。"
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Discordへ投稿せず、生成された内容だけ表示します。",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    setup_logging()
+    args = parse_args()
+    webhook_url, api_key, model = load_settings()
+    today = datetime.now(JST).date()
+
+    logging.info("今日の日付: %s JST", today.isoformat())
+    logging.info("使用モデル: %s", model if api_key else "fallback")
+
+    idea = generate_idea(api_key=api_key, model=model, today=today)
+
+    if args.preview:
+        print(idea)
+        return 0
+
+    try:
+        post_to_discord(webhook_url=webhook_url, message=idea)
+    except Exception:
+        logging.exception("投稿処理でエラーが発生しました。")
+        return 1
+
+    logging.info("Discordへの投稿が完了しました。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+"""Analog horror idea prompts and fallback content.
+
+このファイルを編集すると、AIに出す指示やフォールバック案を調整できます。
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+
+CATEGORIES = [
+    "日常行動 × 禁止",
+    "場所 × 異変",
+    "公共放送・アナウンス系",
+    "施設マニュアル系",
+    "行政文書・注意喚起系",
+    "企業の社内通達系",
+    "監視カメラ・記録映像系",
+    "失踪事件系",
+    "座標・空間異常系",
+    "AI・自動応答・システム異常系",
+    "季節・天気・ニュースに絡めたタイムリーな案",
+]
+
+
+SYSTEM_PROMPT = """あなたはYouTube向けアナログホラー企画の編集者です。
+既存作品の丸パクリを避け、5〜10分の動画にできる具体的な企画案を作ります。
+
+重視する作風:
+- 日常にある行動が急に禁止される怖さ
+- 公共空間、駅、エレベーター、テレビ、トンネル、遊園地、住宅、コンビニなど身近な場所
+- 「ルールを守れば助かる」系
+- 行政文書、注意喚起、社内通達、防災放送、マニュアルのように始まる
+- 徐々におかしくなっていく
+- 直接的な怪物より、ルール・空間・記録・座標・映像・音声の異常を重視
+- 視聴者が「自分の生活でも起きそう」と感じる
+- 安っぽい怪談や幽霊話ではなく、制度・施設・生活習慣の中に異常が混ざる感じ
+
+必ずDiscordにそのまま投稿できる日本語で出力してください。
+怖さは具体的にしつつ、残酷描写や過度なグロ表現には寄せないでください。
+"""
+
+
+def select_category(today: date) -> str:
+    """日付からカテゴリを決めます。
+
+    ランダムにすると同じカテゴリが続くことがあるため、日付ベースで
+    ゆるくローテーションします。GitHub Actionsで毎日実行しても安定します。
+    """
+
+    return CATEGORIES[today.toordinal() % len(CATEGORIES)]
+
+
+def build_user_prompt(today: date) -> str:
+    """OpenAI APIへ渡すユーザープロンプトを作ります。"""
+
+    category = select_category(today)
+    return f"""今日の日付: {today.isoformat()}
+今日のカテゴリ: {category}
+
+以下の形式を厳密に守って、アナログホラーの新作アイデアを1件だけ作ってください。
+各項目は動画制作に使える具体性を持たせてください。
+
+【今日のアナログホラー案】作品タイトル
+
+1. 一言コンセプト
+2. どんな動画か
+3. 視聴者が最初に感じる違和感
+4. 中盤で明らかになる異常
+5. 最後のオチ
+6. 使える演出
+7. サムネ・タイトル案
+8. 制作難易度
+9. YouTubeで伸びそうな理由
+
+追加条件:
+- 1つの独立したアイデアとして成立させる
+- ナレーション、字幕、警告文、資料映像だけでも成立させる
+- 最後に不気味な余韻を残す
+- 可能ならシリーズ化できる余地も入れる
+- 既存作品名や有名キャラクター名は出さない
+"""
+
+
+def fallback_idea(today: date) -> str:
+    """OPENAI_API_KEYがない場合でも投稿できる固定アイデアを返します。"""
+
+    category = select_category(today)
+    return f"""【今日のアナログホラー案】午前7時の横断禁止令
+
+1. 一言コンセプト
+毎朝7時ちょうど、町内のすべての横断歩道を「渡ってはいけない」と告げる行政放送が流れ、守らなかった人の映像だけが翌日の防犯資料に混ざる。
+
+2. どんな動画か
+市役所の交通安全啓発ビデオとして始まります。最初は「通学時間帯の事故防止」と説明されますが、資料映像の信号機、監視カメラ、通学路マップが少しずつ食い違っていきます。カテゴリは「{category}」です。
+
+3. 視聴者が最初に感じる違和感
+放送は「青信号でも渡らないでください」と言い、映像内の歩行者は全員、横断歩道の前で同じ角度に首を向けています。理由は「安全確認のため」とだけ表示されます。
+
+4. 中盤で明らかになる異常
+横断歩道を渡った人は事故に遭うのではなく、次の日の監視カメラ映像で「最初から反対側に立っていた人物」として記録が上書きされます。家族や学校の名簿も、渡った後の位置関係に合わせて微妙に修正されます。
+
+5. 最後のオチ
+動画の最後に「明日から午前7時以外も試験運用を拡大します」と表示されます。直後、視聴者に向けた注意文として「この動画を見終えた方は、本日中に最寄りの横断歩道を確認しないでください」と出ます。
+
+6. 使える演出
+防災無線風のナレーション、白黒の通学路マップ、赤丸で囲まれた監視カメラ静止画、信号機の電子音が途中から人の声に聞こえる音響、行政文書の黒塗り、同じ児童が左右両側に映るフレーム。
+
+7. サムネ・タイトル案
+サムネ: 青信号の横断歩道に「渡らないでください」の赤い公印風文字。
+タイトル案: 「【市交通安全課】午前7時の横断歩道利用制限について」
+
+8. 制作難易度
+低〜中。実写がなくても、地図、文書、信号機写真、監視カメラ風の静止画、読み上げ音声で成立します。
+
+9. YouTubeで伸びそうな理由
+横断歩道と朝の通学時間という身近な題材なので、自分の生活にも起きそうな怖さがあります。行政文書から始まるためリアリティを出しやすく、「他の時間帯では何が起きるのか」というシリーズ化もできます。
+"""
